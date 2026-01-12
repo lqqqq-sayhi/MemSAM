@@ -6,6 +6,11 @@
 3. Evaluation: modified `eval_mask_slice2` to correctly compute the average Dice score across all classes
 4. Model Architecture: `get_model(args.modelname, ...)` in `train_video.py`) is configured to output `C` channels for `C` classes.
 
+CUDA_VISIBLE_DEVICES=1 nohup \
+    python /home/lq/Projects_qin/surgical_semantic_seg/benmarking_algorithms/MemSAM/train_video_multi_class.py \
+    --task Task2 --modelname SAM \
+    > /mnt/hdd2/task2/memsam/train_200.log 2>&1 &
+
 """
 import os
 # os.environ["CUDA_VISIBLE_DEVICES"] = '0'
@@ -47,9 +52,9 @@ def main():
     parser.add_argument('--modelname', default='XMemSAM', type=str, help='type of model, e.g., SAM, SAMFull, MedSAM, MSA, SAMed, SAMUS...')
     parser.add_argument('--encoder_input_size', type=int, default=256, help='the image size of the encoder input, 1024 in SAM and MSA, 512 in SAMed, 256 in SAMUS')
     parser.add_argument('--low_image_size', type=int, default=256, help='the image embedding size, 256 in SAM and MSA, 128 in SAMed and SAMUS')
-    parser.add_argument('--task', default='CAMUS_Video_Full', help='task or dataset name: CAMUS_Video_Full or EchoNet_Video')
+    parser.add_argument('--task', default='Task2', help='task or dataset name: CAMUS_Video_Full or EchoNet_Video')
     parser.add_argument('--vit_name', type=str, default='vit_b', help='select the vit model for the image encoder of sam')
-    parser.add_argument('--sam_ckpt', type=str, default='checkpoints/sam_vit_b_01ec64.pth', help='Pretrained checkpoint of SAM')
+    parser.add_argument('--sam_ckpt', type=str, default='/mnt/hdd2/task2/sam/sam_vit_b_01ec64.pth', help='Pretrained checkpoint of SAM')
     parser.add_argument('--batch_size', type=int, default=1, help='batch_size per gpu') # SAMed is 12 bs with 2n_gpu and lr is 0.005
     parser.add_argument('--n_gpu', type=int, default=1, help='total gpu')
     parser.add_argument('--base_lr', type=float, default=0.0001, help='segmentation network learning rate, 0.005 for SAMed, 0.0001 for MSA') #0.0006
@@ -84,6 +89,7 @@ def main():
     #                     warmup=False,
     #                     warmup_period=250)
     opt = get_config(args.task)
+    opt.task = args.task
     opt.semi = args.semi
 
     device = torch.device(opt.device)
@@ -97,7 +103,7 @@ def main():
         TensorWriter = SummaryWriter(boardpath)
 
     # ==================================================set random seed==================================================
-    seed_value = 1234  # the number of seed
+    seed_value = 301  # the number of seed
     np.random.seed(seed_value)  # set random seed for numpy
     random.seed(seed_value)  # set random seed for python
     os.environ['PYTHONHASHSEED'] = str(seed_value)  # avoid hash random
@@ -116,10 +122,15 @@ def main():
                                 p_contr=0.5, p_gama=0.5, p_distor=0.0, color_jitter_params=None, long_mask=True)  # image reprocessing
     tf_val = JointTransform3D(img_size=args.encoder_input_size, low_img_size=args.low_image_size, ori_size=opt.img_size, crop=opt.crop, p_flip=0, color_jitter_params=None, long_mask=True)
     # tf_train, tf_val = None, None
-    train_dataset = EchoVideoDataset(opt.data_path, opt.train_split, tf_train, img_size=args.encoder_input_size,frame_length=args.frame_length, point_numbers=args.point_numbers, disable_point_prompt=args.disable_point_prompt)
-    val_dataset = EchoVideoDataset(opt.data_path, opt.val_split, tf_val, img_size=args.encoder_input_size,frame_length=args.frame_length, point_numbers=args.point_numbers, disable_point_prompt=args.disable_point_prompt)  # return image, mask, and filename
+
+    train_split_path = os.path.join(opt.data_path, opt.train_split)
+    val_split_path = os.path.join(opt.data_path, opt.val_split)
+
+    train_dataset = EchoVideoDataset(opt.data_path, train_split_path, tf_train, img_size=args.encoder_input_size,frame_length=args.frame_length, point_numbers=args.point_numbers, disable_point_prompt=args.disable_point_prompt)
+    val_dataset = EchoVideoDataset(opt.data_path, val_split_path, tf_val, img_size=args.encoder_input_size,frame_length=args.frame_length, point_numbers=args.point_numbers, disable_point_prompt=args.disable_point_prompt)
     trainloader = DataLoader(train_dataset, batch_size=opt.batch_size, shuffle=True, num_workers=8, pin_memory=True)
     valloader = DataLoader(val_dataset, batch_size=opt.batch_size, shuffle=False, num_workers=8, pin_memory=True)
+
 
     model.to(device)
     if opt.pre_trained:
@@ -142,7 +153,8 @@ def main():
         b_lr = args.base_lr
         optimizer = optim.Adam(model.parameters(), lr=args.base_lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=0, amsgrad=False)
 
-    criterion = get_criterion(modelname=args.modelname, opt=opt)
+    criterion = get_criterion(modelname=args.modelname, 
+                              opt=opt)
 
     pytorch_total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("Total_params: {}".format(pytorch_total_params))
@@ -167,21 +179,33 @@ def main():
             # video to image
             # b, t, c, h, w = imgs.shape
             # -------------------------------------------------------- forward --------------------------------------------------------
-            pred = model(imgs, pt, None)
+            pred = model(imgs, pt, None) # pred shape is (B, T, 1, H, W) for binary, needs to be (B, T, C, H, W) for multi-class
+            print(f"pred.shape: {pred.shape}")
+            # For multi-class, the model architecture needs to output (B, T, C, H, W).
+
+
             # if masks.shape[1] == 10:
             #     masks = masks[:,[0,-1]]
             # semi supervised
             if opt.semi:
                 train_loss = criterion(pred[:,[0,-1],0,:,:], masks[:,[0,-1]])
+                # modify since the loss function is now multi-class
+                
             # full supervised
             else:
-                train_loss = criterion(pred[:,:,0], masks)
+                # train_loss = criterion(pred[:,:,0], masks)
+
+                # modify since the loss function is now multi-class
+                train_loss = criterion(pred, masks) 
+            
             # -------------------------------------------------------- backward -------------------------------------------------------
             optimizer.zero_grad()
             train_loss.backward()
             optimizer.step()
             train_losses += train_loss.item()
-            print(train_loss)
+            print(f"Epoch: {epoch}, Batch: {batch_idx}, Loss: {train_loss.item()}")
+            
+            
             # ------------------------------------------- adjust the learning rate when needed-----------------------------------------
             if args.warmup and iter_num < args.warmup_period:
                 lr_ = args.base_lr * ((iter_num + 1) / args.warmup_period)

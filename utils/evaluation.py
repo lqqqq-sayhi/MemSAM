@@ -187,6 +187,102 @@ def eval_mask_slice2(valloader, model, criterion, opt, args):
         sp_std = np.std(sps*100, axis=0)
         return dice_mean, hd_mean, iou_mean, acc_mean, se_mean, sp_mean, dices_std, hd_std, iou_std, acc_std, se_std, sp_std
 
+
+def eval_mask_slice2_multi_class(valloader, model, criterion, opt, args):
+    """
+    Modification based on eval_mask_slice2() for multi classes.
+    """
+    model.eval()
+    val_losses, mean_dice = 0, 0
+    max_slice_number = opt.batch_size * (len(valloader) + 1)
+    dices = np.zeros((max_slice_number, opt.classes))
+    hds = np.zeros((max_slice_number, opt.classes))
+    ious = np.zeros((max_slice_number, opt.classes))
+    accs = np.zeros((max_slice_number, opt.classes))
+    ses = np.zeros((max_slice_number, opt.classes))
+    sps = np.zeros((max_slice_number, opt.classes))
+    eval_number = 0
+    sum_time = 0
+
+    for batch_idx, (datapack) in enumerate(valloader):
+        imgs = Variable(datapack['image'].to(dtype = torch.float32, device=opt.device))
+        gt_masks = Variable(datapack['label'].to(dtype = torch.long, device=opt.device))
+        image_filename = datapack.get('image_name', None)
+        pt = get_click_prompt(datapack, opt)
+
+        with torch.no_grad():
+            start_time = time.time()
+            pred_logits = model(imgs, pt)
+            sum_time += (time.time() - start_time)
+
+        val_loss = criterion(pred_logits, gt_masks)
+        val_losses += val_loss.item()
+
+        # (B, T, C, H, W) -> (B*T, C, H, W)
+        b, t, c, h, w = pred_logits.shape
+        pred_logits_reshaped = pred_logits.view(b * t, c, h, w)
+        gt_masks_reshaped = gt_masks.view(b * t, h, w)
+
+        # softmax + argmax 得到类别预测
+        pred_masks = torch.argmax(torch.softmax(pred_logits_reshaped, dim=1), dim=1)  # (B*T, H, W)
+
+        pred_masks_np = pred_masks.cpu().numpy()
+        gt_masks_np = gt_masks_reshaped.cpu().numpy()
+
+        # 计算每个类别的指标（不含背景0）
+        for i in range(1, opt.classes):
+            pred_i = (pred_masks_np == i)
+            gt_i = (gt_masks_np == i)
+            # Dice
+            if np.sum(gt_i) == 0 and np.sum(pred_i) == 0:
+                dice = 1.0
+            elif np.sum(gt_i) == 0 and np.sum(pred_i) > 0:
+                dice = 0.0
+            else:
+                dice = metrics.dice_coefficient(pred_i, gt_i)
+            dices[eval_number, i] = dice
+            # IoU, Acc, Se, Sp
+            iou, acc, se, sp = metrics.sespiou_coefficient2(pred_i, gt_i, all=False)
+            ious[eval_number, i] = iou
+            accs[eval_number, i] = acc
+            ses[eval_number, i] = se
+            sps[eval_number, i] = sp
+            # Hausdorff
+            hds[eval_number, i] = hausdorff_distance(pred_i[0, :, :], gt_i[0, :, :], distance="manhattan")
+            # 可视化（可选）
+            if opt.visual and image_filename is not None:
+                visual_segmentation_sets_with_pt(pred_i, image_filename[0], opt, pt[0][0, :, :])
+        eval_number += 1
+
+    dices = dices[:eval_number, :]
+    hds = hds[:eval_number, :]
+    ious = ious[:eval_number, :]
+    accs = accs[:eval_number, :]
+    ses = ses[:eval_number, :]
+    sps = sps[:eval_number, :]
+    val_losses = val_losses / (batch_idx + 1)
+
+    dice_mean = np.mean(dices*100, axis=0)
+    dices_std = np.std(dices*100, axis=0)
+    hd_mean = np.mean(hds, axis=0)
+    hd_std = np.std(hds, axis=0)
+    iou_mean = np.mean(ious*100, axis=0)
+    iou_std = np.std(ious*100, axis=0)
+    acc_mean = np.mean(accs*100, axis=0)
+    acc_std = np.std(accs*100, axis=0)
+    se_mean = np.mean(ses*100, axis=0)
+    se_std = np.std(ses*100, axis=0)
+    sp_mean = np.mean(sps*100, axis=0)
+    sp_std = np.std(sps*100, axis=0)
+
+    mean_dice = np.mean(dice_mean[1:])
+    mean_hdis = np.mean(hd_mean[1:])
+    print("test speed", eval_number/sum_time)
+    if opt.mode == "train":
+        return dices, mean_dice, mean_hdis, val_losses
+    else:
+        return dice_mean, hd_mean, iou_mean, acc_mean, se_mean, sp_mean, dices_std, hd_std, iou_std, acc_std, se_std, sp_std
+
 def eval_camus_patient(valloader, model, criterion, opt, args):
     model.eval()
     val_losses, mean_dice = 0, 0
@@ -912,6 +1008,8 @@ def get_eval(valloader, model, criterion, opt, args):
         return eval_echonet(valloader, model, criterion, opt, args)
     elif opt.eval_mode == "camus":
         return eval_camus(valloader, model, criterion, opt, args)
-
+    elif opt.task == "Task2":
+        print("Using multi-class segmentation evaluation method.")
+        return eval_mask_slice2_multi_class(valloader, model, criterion, opt, args)
     else:
         raise RuntimeError("Could not find the eval mode:", opt.eval_mode)
