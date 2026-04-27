@@ -145,7 +145,7 @@ class Sam(nn.Module):
         imge= self.image_encoder(imgs)
         se, de = self.prompt_encoder(
                       points=pt,
-                      boxes=None,
+                      boxes=bbox,
                       masks=None,
                   )
         low_res_masks, _ = self.mask_decoder(
@@ -156,7 +156,7 @@ class Sam(nn.Module):
                   multimask_output=False,
         )
         masks = F.interpolate(low_res_masks, (self.image_encoder.img_size, self.image_encoder.img_size), mode="bilinear", align_corners=False)
-        outputs = {"low_res_logits": low_res_masks, "masks": low_res_masks}
+        outputs = {"low_res_logits": low_res_masks, "masks": masks}
         return outputs
 
     def postprocess_masks(

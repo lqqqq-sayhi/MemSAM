@@ -12,6 +12,88 @@ CUDA_VISIBLE_DEVICES=1 nohup \
     > /mnt/hdd2/task2/memsam/train_200.log 2>&1 &
 
 """
+
+#==================================================================================================================================================#
+"""
+2026年04月15+16+17号
+注意 每次五折训练前 必须修改config.py中的train_split, val_split
+目前对于本代码文件 作出修改如下
+    1. 早停：lr初始固定在1e-4 连续5个patience就会降低lr到1e-5 如果还不能提升 就会停止训练
+    2. 加上了全面的评估指标 iou/dice/hd95 在evulation.py同步更新了
+    3. data_us.py EchoVideoDataset 修改完毕
+    4. 训练结束后出图
+    5. 新增一个fold参数
+"""
+#=======================================================Debug出现的问题以及修复方法=====================================================================#
+"""
+训练Debug如下：
+    1. 原来的训练代码 config.py里面用的256px训练 (img_size) 但是SAM里面的位置编码是1024 -> 在config.py里面统一分辨率是1024*1024
+    2. 多分类问题 原生SAM的mask decoder只支持二分类 -> 在mask_decoder.py加了一个1*1的卷积层 修改了model_dict.py的初始化逻辑 可以根据生成的class.json里面的类别数量来初始化mask decoder
+    3. 维度问题 数据集是视频序列 维度是(B, T, C, H, W) 但是SAM期望的是2d图像 也就是四维的 不是五维的 -> 在本代码文件和evaluation.py加了一个维度压缩的步骤
+       具体做法是 训练前将将[B, T]压平为单个batch维度传给模型 然后训练后将输出重新reshape回[B, T, C, H, W]进行loss计算和指标评估
+       和我们的SAM_LRU有一点点像
+    4. 有个报错是Indexing Assertion Error -> 数据集里面class.json是30个class 但是config.py里面是29个 所以会索引越界 现在改成30了
+    5. 因为我们需要hd95 原代码好像没有用到 然后evaluation计算时因为数据类型导致计算异常 -> 在evaluation.py对Hausdorff的输入转换成float32
+    6. 新增一个fold参数
+
+用例(fold0):
+    CUDA_VISIBLE_DEVICES=1 nohup \
+    python /home/lq/Projects_qin/surgical_semantic_seg/benmarking_algorithms/MemSAM/train_video_multi_class.py \
+    --task Task2 --modelname SAM \
+    > /mnt/hdd2/task2/memsam/train_fold0.log 2>&1 &
+
+切换fold前注意修改config.py!!!!
+
+结果保存在/mnt/hdd2/task2/memsam/checkpoints/Task2/
+
+CUDA_VISIBLE_DEVICES=0 nohup \
+python /home/lq/Projects_qin/surgical_semantic_seg/benmarking_algorithms/MemSAM/train_video_multi_class.py \
+    --task Task2 --modelname SAM \
+    --encoder_input_size 1024 --low_image_size 256 --frame_length 10 \
+    --fold 0 --exp_id 1 \
+    > /mnt/hdd2/task2/memsam/train_fold0_exp1.log 2>&1 &
+"""
+
+#=======================================================后续实验问题=================================================================================#
+"""
+由于/mnt/hdd2/task2/memsam/train_fold0.log epoch1就best了 后续进行优化
+1. 特征维度提升 将cls_head的输入从1通道mask提升到32维图像特征 (这个从exp_id1开始实现)
+2. 增加mask_decoder显式解冻
+3. 修复iou区间问题
+4. 新增exp_id参数
+"""
+
+"""
+2026年04月17日debug记录
+
+因为换用逻辑：就是把30类问题变成30个二值问题 每次训练输出一个图像+某个类别的bbox 输出一个binary mask然后重复30次
+
+命令：
+CUDA_VISIBLE_DEVICES=0 nohup \
+python /home/lq/Projects_qin/surgical_semantic_seg/benmarking_algorithms/MemSAM/train_video_multi_class.py \
+    --task Task2 --modelname MemSAM \
+    --encoder_input_size 256 --low_image_size 256 --frame_length 10 \
+    --fold 0 --exp_id 2 \
+    > /mnt/hdd2/task2/memsam/train_fold0_exp2.log 2>&1 &
+
+修复bug如下：
+    1. mask_decoder.py -> 删除cls_head 恢复SAM单通道二值输出
+    2. model_dict.py -> MemSAM分支解冻mask_decoder
+    3. data_us.py的load_video_and_mask_file未返回frame_inds -> 添加frame_inds返回值
+    4. JointTransform3D之前就做了mask二值化 应该先做transform然后再做二值化
+    5. BBox坐标尺度不匹配 json里面bbox是1024 但图像resize到256 prompt完全超出图像边界导致预测全背景 -> data_us.py缩放
+
+结论: 
+    训练确实可以再次跑通 loss在下降 但是验证集指标一直是0 后来加了debug print 发现如下 具体在/mnt/hdd2/task2/memsam/train_fold0_exp2.log
+    类似[Debug Val] clip_idx=40, c_id=9, out range=[-2.665, -2.189], pred_fg_mean=0.0000, gt_fg_mean=0.0026：
+        gt有前景(gt_fg_mean大于0的)这个没问题 但是输出out range都是负的 而且不同的c_id和bbox对应的out range基本上一样
+        说明bbox prompt对于输出没影响！
+        再次看一遍论文 memsam的memory模块是在心脏超声上面预训练的 我们迁移到手术器械或者器官上 偏置太多了
+        他们的forward_with_memory只在第一帧使用bbox prompt 记忆模块在后续帧中压过了prompt的引导
+
+所以我觉得我们这个任务+数据集 不适合用memsam做baseline
+"""
+
 import os
 # os.environ["CUDA_VISIBLE_DEVICES"] = '0'
 import argparse
@@ -30,9 +112,14 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 import time
 import random
+from tqdm import tqdm
 from utils.config import get_config
 from utils.evaluation import get_eval
 from importlib import import_module
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import pandas as pd
 
 from torch.nn.modules.loss import CrossEntropyLoss
 from monai.losses import DiceCELoss
@@ -67,6 +154,8 @@ def main():
     parser.add_argument('--semi', action="store_true")
     parser.add_argument('--reinforce', action="store_true")
     parser.add_argument('--disable_point_prompt', action="store_true")
+    parser.add_argument('--fold', type=int, default=0, help='fold number for cross validation')
+    parser.add_argument('--exp_id', type=int, default=0, help='experiment ID')
     args = parser.parse_args()
     print(args)
 
@@ -91,6 +180,24 @@ def main():
     opt = get_config(args.task)
     opt.task = args.task
     opt.semi = args.semi
+    
+    # REQUIRED: Sync command line args to opt to avoid resolution mismatch between Model and DataLoader
+    opt.encoder_input_size = args.encoder_input_size
+    opt.low_image_size = args.low_image_size
+    opt.img_size = args.encoder_input_size
+    opt.batch_size = args.batch_size
+    opt.modelname = args.modelname
+
+    # Append fold and exp_id to output paths for better organization
+    fold_str = f'fold{args.fold}_exp_id{args.exp_id}'
+    opt.save_path = os.path.join(opt.save_path, fold_str)
+    opt.result_path = os.path.join(opt.result_path, fold_str)
+    opt.tensorboard_path = os.path.join(opt.tensorboard_path, fold_str)
+    
+    # Ensure trailing slashes for the '+' concatenations used elsewhere in the script
+    if not opt.save_path.endswith('/'): opt.save_path += '/'
+    if not opt.result_path.endswith('/'): opt.result_path += '/'
+    if not opt.tensorboard_path.endswith('/'): opt.tensorboard_path += '/'
 
     device = torch.device(opt.device)
     if args.keep_log:
@@ -128,8 +235,16 @@ def main():
 
     train_dataset = EchoVideoDataset(opt.data_path, train_split_path, tf_train, img_size=args.encoder_input_size,frame_length=args.frame_length, point_numbers=args.point_numbers, disable_point_prompt=args.disable_point_prompt)
     val_dataset = EchoVideoDataset(opt.data_path, val_split_path, tf_val, img_size=args.encoder_input_size,frame_length=args.frame_length, point_numbers=args.point_numbers, disable_point_prompt=args.disable_point_prompt)
-    trainloader = DataLoader(train_dataset, batch_size=opt.batch_size, shuffle=True, num_workers=8, pin_memory=True)
-    valloader = DataLoader(val_dataset, batch_size=opt.batch_size, shuffle=False, num_workers=8, pin_memory=True)
+    from torch.utils.data.dataloader import default_collate
+    def ovr_collate_fn(batch):
+        # We need to pop available_classes because it has irregular lengths which default_collate hates
+        available_classes = [item.pop('available_classes') for item in batch]
+        collated_batch = default_collate(batch)
+        collated_batch['available_classes'] = available_classes
+        return collated_batch
+
+    trainloader = DataLoader(train_dataset, batch_size=opt.batch_size, shuffle=True, num_workers=8, pin_memory=True, collate_fn=ovr_collate_fn)
+    valloader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=8, pin_memory=True, collate_fn=ovr_collate_fn)
 
 
     model.to(device)
@@ -146,117 +261,270 @@ def main():
     if args.n_gpu > 1:
         model = nn.DataParallel(model)
 
-    if args.warmup:
-        b_lr = args.base_lr / args.warmup_period
-        optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=b_lr, betas=(0.9, 0.999), weight_decay=0.1)
-    else:
-        b_lr = args.base_lr
-        optimizer = optim.Adam(model.parameters(), lr=args.base_lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=0, amsgrad=False)
+    current_lr = 1e-4
+    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=current_lr, betas=(0.9, 0.999), weight_decay=0.1)
 
-    criterion = get_criterion(modelname=args.modelname, 
-                              opt=opt)
+    criterion = get_criterion(modelname=args.modelname, opt=opt)
 
     pytorch_total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("Total_params: {}".format(pytorch_total_params))
 
     #  ========================================================================= begin to train the model ============================================================================
-    iter_num = 0
-    max_iterations = opt.epochs * len(trainloader)
-    best_dice, loss_log, dice_log = 0.0, np.zeros(opt.epochs+1), np.zeros(opt.epochs+1)
+    train_loss_history, val_loss_history = [], []
+    train_iou_history, val_iou_history = [], []
+    val_dice_history, val_hd95_history = [], []
+
+    best_dice = 0.0
+    patience_counter = 0
+    lr_dropped = 0
+
     for epoch in range(opt.epochs):
         #  --------------------------------------------------------- training ---------------------------------------------------------
         model.train()
         train_losses = 0
-        for batch_idx, (datapack) in enumerate(trainloader):
+        train_intersections = 0.0
+        train_unions = 0.0
+        
+        tbar = tqdm(trainloader)
+        for batch_idx, (datapack) in enumerate(tbar):
             imgs = datapack['image'].to(dtype = torch.float32, device=opt.device)
             masks = datapack['label'].to(dtype = torch.float32, device=opt.device)
-            if args.disable_point_prompt:
-                # pt[0]: b t point_num 2
-                # pt[1]: t point_num
-                pt = None
-            else:
-                pt = get_click_prompt(datapack, opt) 
-            # video to image
-            # b, t, c, h, w = imgs.shape
-            # -------------------------------------------------------- forward --------------------------------------------------------
-            pred = model(imgs, pt, None) # pred shape is (B, T, 1, H, W) for binary, needs to be (B, T, C, H, W) for multi-class
-            print(f"pred.shape: {pred.shape}")
-            # For multi-class, the model architecture needs to output (B, T, C, H, W).
-
-
-            # if masks.shape[1] == 10:
-            #     masks = masks[:,[0,-1]]
-            # semi supervised
-            if opt.semi:
-                train_loss = criterion(pred[:,[0,-1],0,:,:], masks[:,[0,-1]])
-                # modify since the loss function is now multi-class
-                
-            # full supervised
-            else:
-                # train_loss = criterion(pred[:,:,0], masks)
-
-                # modify since the loss function is now multi-class
-                train_loss = criterion(pred, masks) 
+            bboxes = datapack['bbox'].to(dtype = torch.float32, device=opt.device)
             
-            # -------------------------------------------------------- backward -------------------------------------------------------
             optimizer.zero_grad()
-            train_loss.backward()
+            
+            # MemSAM binary forward with BBox prompt
+            # out shape: (B, T, 1, H, W)
+            out = model(imgs, pt=None, bbox=bboxes)
+            
+            # masks: (B, T, H, W) from DataLoader
+            # Convert to (B, T, 1, H, W) to match model output
+            target_masks = masks.unsqueeze(2)
+            
+            loss = criterion(out, target_masks)
+            loss.backward()
             optimizer.step()
-            train_losses += train_loss.item()
-            print(f"Epoch: {epoch}, Batch: {batch_idx}, Loss: {train_loss.item()}")
             
+            train_losses += loss.item()
             
-            # ------------------------------------------- adjust the learning rate when needed-----------------------------------------
-            if args.warmup and iter_num < args.warmup_period:
-                lr_ = args.base_lr * ((iter_num + 1) / args.warmup_period)
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = lr_
-            else:
-                if args.warmup:
-                    shift_iter = iter_num - args.warmup_period
-                    assert shift_iter >= 0, f'Shift iter is {shift_iter}, smaller than zero'
-                    lr_ = args.base_lr * (1.0 - shift_iter / max_iterations) ** 0.9  # learning rate adjustment depends on the max iterations
-                    for param_group in optimizer.param_groups:
-                        param_group['lr'] = lr_
-            iter_num = iter_num + 1
+            # Metric calculation (Binary IoU)
+            with torch.no_grad():
+                pred_bin = (out.sigmoid() > 0.5).float()
+                inter = torch.sum(pred_bin * target_masks).item()
+                union = torch.sum(pred_bin) + torch.sum(target_masks) - inter
+                train_intersections += inter
+                train_unions += max(union.item() if torch.is_tensor(union) else union, 1e-6)
+                
+            tbar.set_description(f"Epoch {epoch} Train loss: {loss.item():.4f}")
 
         #  -------------------------------------------------- log the train progress --------------------------------------------------
-        print('epoch [{}/{}], train loss:{:.4f}'.format(epoch, opt.epochs, train_losses / (batch_idx + 1)))
+        train_loss_hist = train_losses / len(trainloader)
+        train_iou_hist = (train_intersections / train_unions) * 100
+        print('epoch [{}/{}], train loss:{:.4f}, train IoU:{:.4f}'.format(epoch, opt.epochs, train_loss_hist, train_iou_hist))
+        
+        train_loss_history.append(train_loss_hist)
+        train_iou_history.append(train_iou_hist)
+        
         if args.keep_log:
-            TensorWriter.add_scalar('train_loss', train_losses / (batch_idx + 1), epoch)
-            TensorWriter.add_scalar('learning rate', optimizer.state_dict()['param_groups'][0]['lr'], epoch)
-            loss_log[epoch] = train_losses / (batch_idx + 1)
+            TensorWriter.add_scalar('train_loss', train_loss_hist, epoch)
+            TensorWriter.add_scalar('learning rate', current_lr, epoch)
 
         #  --------------------------------------------------------- evaluation ----------------------------------------------------------
         if epoch % opt.eval_freq == 0:
             model.eval()
-            dices, mean_dice, _, val_losses = get_eval(valloader, model, criterion=criterion, opt=opt, args=args)
-            print('epoch [{}/{}], val loss:{:.4f}'.format(epoch, opt.epochs, val_losses))
-            print('epoch [{}/{}], val dice:{:.4f}'.format(epoch, opt.epochs, mean_dice))
+            val_iou, val_dice = [], []
+            
+            print(f"Rigorous evaluation: iterating all classes per clip...")
+            vbar = tqdm(valloader)
+            for v_idx, datapack in enumerate(vbar):
+                imgs = datapack['image'].to(dtype=torch.float32, device=opt.device)
+                full_masks = datapack['full_mask'].to(device=opt.device) # (B, 1, T, H, W)
+                selected_keys = datapack['selected_keys']
+                
+                # available_classes was returned as a list of integers
+                curr_available_classes = datapack['available_classes']
+                
+                # Since validation batch_size is 1, take the first element (the list of classes for this clip)
+                classes_to_test = curr_available_classes[0]
+                
+                clip_results_iou, clip_results_dice = [], []
+                
+                for c_id in classes_to_test:
+                    c_id = int(c_id)
+                    # Use .long() to ensure exact integer comparison for multi-class mask
+                    bin_gt = (full_masks.long() == c_id).float()
+                    
+                    # Fetch BBoxes for THIS class from the dataset's JSON using selected_keys
+                    json_bboxes = []
+                    for k_name in selected_keys:
+                        # k_name may be a string (bs=1) or a list/tuple
+                        actual_key = k_name[0] if isinstance(k_name, (list, tuple)) else k_name
+                        frame_info = valloader.dataset.bbox_json[actual_key]
+                        found_box = [-1, -1, opt.img_size, opt.img_size]
+                        for item in frame_info:
+                            item_c_id = int(item['mask_path'].split('class')[-1].split('.')[0])
+                            if item_c_id == c_id:
+                                # Scale BBox from JSON (1024) to model resolution
+                                scale = opt.img_size / 1024.0
+                                orig_box = item['bbox']
+                                found_box = [coord * scale for coord in orig_box]
+                                break
+                        json_bboxes.append(found_box)
+                    
+                    curr_bboxes = torch.tensor(json_bboxes, dtype=torch.float32, device=opt.device).unsqueeze(0) # (1, T, 4)
+                    
+                    with torch.no_grad():
+                        # out shape: (B, T, 1, H, W)
+                        out = model(imgs, pt=None, bbox=curr_bboxes)
+                        # bin_gt: (B, T, H, W) -> unsqueeze to (B, T, 1, H, W)
+                        target_masks = bin_gt.unsqueeze(2)
+                        
+                        # DEBUG PRINTS
+                        with torch.no_grad():
+                            pred_temp = (out.sigmoid() > 0.5).float()
+                            print(f"  [Debug Val] clip_idx={batch_idx}, c_id={c_id}, "
+                                  f"out range=[{out.min().item():.3f}, {out.max().item():.3f}], "
+                                  f"pred_fg_mean={pred_temp.mean().item():.4f}, "
+                                  f"gt_fg_mean={target_masks.mean().item():.4f}")
+                        
+                        pred = (out.sigmoid() > 0.5).float()
+                        
+                        inter = torch.sum(pred * target_masks).item()
+                        union = torch.sum(pred) + torch.sum(target_masks) - inter
+                        
+                        clip_results_iou.append(inter / max(union.item() if torch.is_tensor(union) else union, 1e-6))
+                        clip_results_dice.append(((2 * inter) / (torch.sum(pred) + torch.sum(target_masks) + 1e-6)).item())
+                
+                if clip_results_iou:
+                    val_iou.append(np.mean(clip_results_iou))
+                    val_dice.append(np.mean(clip_results_dice))
+                
+            mean_iou = np.mean(val_iou) * 100
+            mean_dice = np.mean(val_dice) * 100
+            
+            print('epoch [{}/{}], val dice:{:.4f}, val iou:{:.4f}'.format(epoch, opt.epochs, mean_dice, mean_iou))
+            
+            val_loss_history.append(0.0) # Placeholder
+            val_dice_history.append(mean_dice)
+            val_iou_history.append(mean_iou)
+            val_hd95_history.append(0.0)
+            
             if args.keep_log:
-                TensorWriter.add_scalar('val_loss', val_losses, epoch)
-                TensorWriter.add_scalar('dices', mean_dice, epoch)
-                dice_log[epoch] = mean_dice
+                TensorWriter.add_scalar('val_dice', mean_dice, epoch)
+                
             if mean_dice > best_dice:
                 best_dice = mean_dice
-                timestr = time.strftime('%m%d%H%M')
-                if not os.path.isdir(opt.save_path):
-                    os.makedirs(opt.save_path)
-                save_path = opt.save_path + args.modelname + opt.save_path_code + '%s' % timestr + '_' + str(epoch) + '_' + str(best_dice)
-                torch.save(model.state_dict(), save_path + ".pth", _use_new_zipfile_serialization=False)
+                patience_counter = 0 
+                if not os.path.isdir(opt.save_path): os.makedirs(opt.save_path)
+                save_path = f"{opt.save_path}{args.modelname}_best.pth"
+                torch.save(model.state_dict(), save_path, _use_new_zipfile_serialization=False)
+                print(f"==> New best validation Dice: {best_dice:.4f}! Saved.")
+            else:
+                patience_counter += 1
+                if patience_counter >= 5:
+                    print(f"==> Patience limit reached. Dropping LR.")
+                    lr_dropped += 1
+                    patience_counter = 0
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] = param_group['lr'] * 0.1
+                    if lr_dropped >= 2:
+                        print("==> Early stopping triggered.")
+                        break
+                        
         if epoch % opt.save_freq == 0 or epoch == (opt.epochs-1):
-            if not os.path.isdir(opt.save_path):
-                os.makedirs(opt.save_path)
-            save_path = opt.save_path + args.modelname + opt.save_path_code + '_' + str(epoch)
-            torch.save(model.state_dict(), save_path + ".pth", _use_new_zipfile_serialization=False)
-            # if args.keep_log:
-            #     with open(opt.tensorboard_path + args.modelname + opt.save_path_code + logtimestr + '/trainloss.txt', 'w') as f:
-            #         for i in range(len(loss_log)):
-            #             f.write(str(loss_log[i])+'\n')
-            #     with open(opt.tensorboard_path + args.modelname + opt.save_path_code + logtimestr + '/dice.txt', 'w') as f:
-            #         for i in range(len(dice_log)):
-            #             f.write(str(dice_log[i])+'\n')
+            if not os.path.isdir(opt.save_path): os.makedirs(opt.save_path)
+            torch.save(model.state_dict(), f"{opt.save_path}{args.modelname}_last.pth", _use_new_zipfile_serialization=False)
+            
+    # ============================ 训练结束：生成CSV和指标曲线 ============================
+    print("Training finished! Generating history plots...")
+    epochs_range = list(range(len(train_loss_history)))
+    
+    # Simple Plotting
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs_range, train_loss_history, label='Train Loss')
+    plt.title('Loss History')
+    plt.legend()
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs_range, train_iou_history, label='Train IoU')
+    if val_iou_history:
+        val_epochs = list(range(0, len(val_iou_history) * opt.eval_freq, opt.eval_freq))
+        plt.plot(val_epochs, val_iou_history, label='Val IoU')
+    plt.title('IoU History')
+    plt.legend()
+    plt.savefig(os.path.join(opt.save_path, 'history_plots.png'))
+    print(f"Plots saved to {opt.save_path}")
 
+    # 填充验证集数据以匹配 train 的维度，方便导出对齐的 CSV
+    # 如果 eval_freq 是 1，长度即相等
+    metrics_df = pd.DataFrame({
+        "Epoch": epochs_range,
+        "Train_Mean_Loss": train_loss_history,
+        "Train_Mean_IoU": train_iou_history
+    })
+    
+    val_epochs_range = list(range(0, len(val_loss_history) * opt.eval_freq, opt.eval_freq))
+    val_df = pd.DataFrame({
+        "Epoch": val_epochs_range,
+        "Val_Mean_Loss": val_loss_history,
+        "Val_Mean_Dice": val_dice_history,
+        "Val_Mean_IoU": val_iou_history,
+        "Val_Mean_HD95": val_hd95_history
+    })
+    
+    final_df = pd.merge(metrics_df, val_df, on="Epoch", how="left")
+    
+    if not os.path.isdir(opt.save_path):
+        os.makedirs(opt.save_path)
+    csv_path = os.path.join(opt.save_path, "training_metrics_history.csv")
+    final_df.to_csv(csv_path, index=False)
+    print(f"Saved metrics CSV to {csv_path}")
+
+    # ===== Requested plotting logic =====
+    plt.figure(figsize=(15, 12))
+    
+    plt.subplot(2, 2, 1)
+    plt.plot(train_loss_history, label='Training Mean Loss', marker='o')
+    plt.plot(val_epochs_range, val_loss_history, label='Validation Mean Loss', marker='s')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Mean Loss')
+    plt.grid(True)
+    plt.legend()
+
+    plt.subplot(2, 2, 2)
+    plt.plot(train_iou_history, label='Training Mean IoU', color='orange', marker='o')
+    plt.plot(val_epochs_range, val_iou_history, label='Validation Mean IoU', color='red', marker='s')
+    plt.xlabel('Epoch')
+    plt.ylabel('IoU')
+    plt.title('Training and Validation Mean IoU')
+    plt.grid(True)
+    plt.legend()
+
+    plt.subplot(2, 2, 3)
+    plt.plot(val_epochs_range, val_dice_history, label='Validation Mean Dice', marker='s')
+    plt.plot(val_epochs_range, val_iou_history, label='Validation Mean IoU', marker='s')
+    plt.xlabel('Epoch')
+    plt.ylabel('Score')
+    plt.title('Validation Mean Dice and Mean IoU')
+    plt.grid(True)
+    plt.legend()
+
+    plt.subplot(2, 2, 4)
+    plt.plot(val_epochs_range, val_hd95_history, label='Validation Mean HD95', color='red', marker='s')
+    plt.xlabel('Epoch')
+    plt.ylabel('HD95')
+    plt.title('Validation Mean HD95')
+    plt.grid(True)
+    plt.legend()
+
+    plt.tight_layout()
+    plot_path = os.path.join(opt.save_path, "training_curves.png")
+    plt.savefig(plot_path)
+    plt.close()
+    print(f"Saved plotting curves to {plot_path}")
 
 if __name__ == '__main__':
     main()

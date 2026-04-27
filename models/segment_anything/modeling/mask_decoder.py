@@ -68,6 +68,7 @@ class MaskDecoder(nn.Module):
             transformer_dim, iou_head_hidden_dim, self.num_mask_tokens, iou_head_depth
         )
 
+
     def forward(
         self,
         image_embeddings: torch.Tensor,
@@ -98,6 +99,8 @@ class MaskDecoder(nn.Module):
             dense_prompt_embeddings=dense_prompt_embeddings,
         )
 
+        # If cls_head is present, it already produced the multi-class masks inside predict_masks.
+        # Select the correct mask or masks for output (if not using multi-class head)
         # Select the correct mask or masks for output
         if multimask_output:
             mask_slice = slice(1, None)

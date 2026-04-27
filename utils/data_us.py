@@ -35,13 +35,15 @@ def load_video_and_mask_file(img_path: str,
             imgs: (F,3,112,112)
             masks: (2,112,112)  ED and ES frame
             ef: float
-            edv, esv, spacing
+            edv, esv, spacing, frame_inds
     '''
     # load video
     video = np.load(img_path, allow_pickle=True)
     video = video.swapaxes(0, 1)
     kpts_list = np.load(anno_path, allow_pickle=True)
-    ef, edv, esv = kpts_list['ef'], kpts_list['edv'], kpts_list['esv']
+    ef = kpts_list['ef'] if 'ef' in kpts_list else 0.0
+    edv = kpts_list['edv'] if 'edv' in kpts_list else 0.0
+    esv = kpts_list['esv'] if 'esv' in kpts_list else 0.0
 
     # Collect masks:
     idx_list = []
@@ -83,7 +85,7 @@ def load_video_and_mask_file(img_path: str,
 
     spacing = kpts_list['spacing']
 
-    return imgs, select_masks, ef, edv, esv, spacing
+    return imgs, select_masks, ef, edv, esv, spacing, frame_inds
 
 
 def to_long_tensor(pic):
@@ -789,19 +791,34 @@ class EchoVideoDataset(Dataset):
                  one_hot_mask: int = False,
                  frame_length: int = 2,
                  disable_point_prompt: bool = True,
-                 point_numbers: int = 1) -> None:
+                 point_numbers: int = 1,
+                 json_img_size: int = 1024) -> None:
         self.dataset_path = dataset_path
         self.one_hot_mask = one_hot_mask
         self.split = split
         self.frame_length = frame_length
         self.point_numbers = point_numbers
+        self.img_size = img_size
+        self.json_img_size = json_img_size
         self.ids = []
-        for _, _, files in os.walk(os.path.join(dataset_path, 'videos',
-                                                split)):
-            self.ids = files
-
-        # id_list_file = os.path.join(dataset_path, '{0}.txt'.format(split))
-        # self.ids = [id_.strip() for id_ in open(id_list_file)]
+        
+        # Support .txt file list or directory-based loading
+        if split.endswith('.txt') and os.path.isfile(split):
+            # Absolute path to a txt file (e.g. from train_video_multi_class.py)
+            with open(split, 'r') as f: 
+                self.ids = [line.strip() for line in f if line.strip()]
+        else:
+            # Try as relative txt inside dataset_path
+            txt_path = os.path.join(dataset_path, split)
+            if os.path.isfile(txt_path):
+                with open(txt_path, 'r') as f:
+                    self.ids = [line.strip() for line in f if line.strip()]
+            else:
+                # Fallback: scan directory
+                search_dir = os.path.join(dataset_path, 'videos', split)
+                if os.path.isdir(search_dir):
+                    for _, _, files in os.walk(search_dir):
+                        self.ids.extend(files)
         self.prompt = prompt
         self.disable_point_prompt = disable_point_prompt
         self.img_size = img_size
@@ -816,77 +833,111 @@ class EchoVideoDataset(Dataset):
             to_tensor = torch.tensor
             self.joint_transform = lambda x, y: (to_tensor(x), to_tensor(y))
 
+        # Load BBox JSON for OvR training/validation
+        # Using paths confirmed by USER
+        if 'train' in split:
+            self.json_path = '/mnt/hdd2/task2/sam_lora/output_bbox_train1.json'
+            self.json_split = 'train1'
+        else:
+            self.json_path = '/mnt/hdd2/task2/sam_lora/output_bbox_val1.json'
+            self.json_split = 'val1'
+        
+        with open(self.json_path, 'r') as f:
+            self.bbox_json = json.load(f)[self.json_split]
+        print(f"[Dataset] Loaded BBox JSON from {self.json_path} for split {split}")
+
     def __len__(self):
         return len(self.ids)
 
     def __getitem__(self, i):
         filename = self.ids[i]
         prefix, _ = os.path.splitext(filename)
-        sub_path = 'EchoNet'
-        class_id = 1
+        # dynamically retrieve the dataset key
+        sub_path = list(self.class_dict.keys())[0] if self.class_dict else 'EchoNet'
 
-        img_path = os.path.join(os.path.join(self.dataset_path, 'videos'), self.split)
-        label_path = os.path.join(os.path.join(self.dataset_path, 'annotations'), self.split)
-        image, mask, ef, edv, esv, spacing = load_video_and_mask_file(
-            img_path=os.path.join(img_path, prefix + '.npy'),
-            anno_path=os.path.join(label_path, prefix + '.npz'),
+        # Dynamic path resolution: search across train/val/test subdirs
+        vid_path = None
+        ann_path = None
+        for folder in ['train', 'val', 'test', '']:
+            cand_vid = os.path.join(self.dataset_path, 'videos', folder, prefix + '.npy')
+            cand_ann = os.path.join(self.dataset_path, 'annotations', folder, prefix + '.npz')
+            if os.path.exists(cand_vid):
+                vid_path = cand_vid
+                ann_path = cand_ann
+                break
+        if vid_path is None:
+            raise FileNotFoundError(f"Could not find {prefix}.npy in {self.dataset_path}/videos/*/")
+        
+        # 1. 核心修复：获取实际采样的帧索引 (frame_inds)
+        image, mask, ef, edv, esv, spacing, frame_inds = load_video_and_mask_file(
+            img_path=vid_path,
+            anno_path=ann_path,
             frame_length=self.frame_length)
-        classes = self.class_dict[sub_path]
-        if classes == 2:
-            mask[mask > 1] = 0
 
-        # data aug
-        # correct dimensions if needed
-        # image, mask = correct_dims(image, mask)
+        # OvR Mapping Logic: map patient ID to sorted JSON keys
+        json_prefix = prefix.replace('patient', '')
+        all_keys = self.bbox_json.keys()
+        patient_keys = sorted([k for k in all_keys if k.startswith(f"{json_prefix}_")])
+        
+        # 2. 核心修复：利用索引精确匹配每帧对应的 JSON key
+        selected_keys = [patient_keys[idx] for idx in frame_inds]
+        
+        # 3. 核心修复：仅收集当前加载的 10 帧中真实存在的类别
+        available_classes = set()
+        for k_name in selected_keys:
+            frame_info = self.bbox_json[k_name]
+            for item in frame_info:
+                c_id_str = item['mask_path'].split('class')[-1].split('.')[0]
+                available_classes.add(int(c_id_str))
+        
+        available_classes = sorted(list(available_classes))
+        
+        # 训练时随机选一个，验证时我们会使用全列表
+        if len(available_classes) > 0:
+            selected_class = int(np.random.choice(available_classes))
+        else:
+            selected_class = 1 # 兜底值
+
+        # 4. 获取选中类别的 BBox 序列
+        bboxes = []
+        for k_name in selected_keys:
+            frame_info = self.bbox_json[k_name]
+            found = False
+            for item in frame_info:
+                c_id_str = item['mask_path'].split('class')[-1].split('.')[0]
+                if int(c_id_str) == selected_class:
+                    # Scale BBox from JSON (1024) to model resolution (e.g., 256)
+                    scale = self.img_size / 1024.0
+                    raw_box = item['bbox']
+                    bboxes.append([coord * scale for coord in raw_box])
+                    found = True
+                    break
+            if not found:
+                bboxes.append([-1, -1, self.img_size, self.img_size]) # 空框
+
+        bboxes = np.array(bboxes[:self.frame_length]) # (T, 4)
+
+        # 5. 核心修复：先做 JointTransform (此时 mask 还是多分类原始值)
         if self.joint_transform:
             image, mask = self.joint_transform(image, mask)
-            
-        # --------- make the point prompt -----------------
-        pts, point_labels = [], []  
-        pt = []
-        if not self.disable_point_prompt:
-            if self.prompt == 'click':
-                if 'train' in self.split:
-                    for mask_ in mask:
-                        pt, point_label = random_click(np.array(mask_), class_id)
-                        if self.point_numbers > 1:
-                            for i in range(1, self.point_numbers):
-                                _pt, _point_label = random_click(np.array(mask_), class_id)
-                                pt = np.concatenate([pt, _pt], axis=0)
-                                point_label = np.concatenate([point_label, _point_label], axis=0)
-                        pts.append(pt)
-                        point_labels.append(point_label)
-                else:
-                    for mask_ in mask:
-                        pt, point_label = fixed_click(np.array(mask_), class_id)
-                        if self.point_numbers > 1:
-                            for i in range(1, self.point_numbers):
-                                _pt, _point_label = fixed_click(np.array(mask_), class_id)
-                                pt = np.concatenate([pt, _pt], axis=0)
-                                point_label = np.concatenate([point_label, _point_label], axis=0)
-                        pts.append(pt)
-                        point_labels.append(point_label)
-                pt = np.stack(pts)
-                point_label = np.stack(point_labels)
-        if self.one_hot_mask:
-            assert self.one_hot_mask > 0, 'one_hot_mask must be nonnegative'
-            mask = torch.zeros((self.one_hot_mask, mask.shape[1],
-                                mask.shape[2])).scatter_(0, mask.long(), 1)
 
-        # low_mask = low_mask.unsqueeze(0)
+        # 6. 核心修复：后做二值化处理
+        if isinstance(mask, torch.Tensor):
+            bin_mask = (mask == selected_class).float()
+        else:
+            bin_mask = (mask == selected_class).astype(np.float32)
 
+        # 返回包中增加 available_classes 以便验证集遍历
         return {
-            'image': image,
-            'label': mask,
-            'p_label': point_labels,
-            'pt': pt,
-            # 'low_mask': low_mask,
+            'image': image,                   # (3, T, H, W)
+            'label': bin_mask,                # (1, T, H, W) 二值结果
+            'full_mask': mask,                # (1, T, H, W) 原始多类结果，用于验证集遍历
+            'bbox': torch.tensor(bboxes, dtype=torch.float32),
+            'class_id': selected_class,
+            'available_classes': available_classes,
             'image_name': filename,
-            'class_id': class_id,
-            'ef': ef,
-            'edv': edv,
-            'esv': esv,
-            'spacing':spacing,
+            'prefix': json_prefix,
+            'selected_keys': selected_keys
         }
 
 

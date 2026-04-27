@@ -197,9 +197,15 @@ class MemSAM(nn.Module):
         self,
         imgs: torch.Tensor, # [b,t,c,h,w]
         pt: Tuple[torch.Tensor, torch.Tensor],  # ([b n 1 2], [b n])
-        bbox: torch.Tensor=None, # b 4
+        bbox: torch.Tensor=None, # [b, t, 4] or [b, 4]
     ) -> torch.Tensor:
         b, t, c, h, w = imgs.shape  # b t c h w
+        # If bbox is (B, T, 4), take the first frame for initialization
+        if bbox is not None and bbox.dim() == 3:
+            first_bbox = bbox[:, 0, :]
+        else:
+            first_bbox = bbox
+
         # encode imgs to imgs embedding
         key, shrinkage, selection, imge = self.memory('encode_key', imgs)
         # init memory
@@ -209,13 +215,13 @@ class MemSAM(nn.Module):
         if pt is not None:
             se, de = self.prompt_encoder(# se b 2 256, de b 256 32 32
                         points=(pt[0][:,0],pt[1][:1]),
-                        boxes=None,
+                        boxes=first_bbox,
                         masks=None,
                     )
         else:
             se, de = self.prompt_encoder(# se b 2 256, de b 256 32 32
                         points=None,
-                        boxes=None,
+                        boxes=first_bbox,
                         masks=None,
                     )
         mask, _ = self.mask_decoder(

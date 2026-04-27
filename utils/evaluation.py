@@ -212,7 +212,26 @@ def eval_mask_slice2_multi_class(valloader, model, criterion, opt, args):
 
         with torch.no_grad():
             start_time = time.time()
-            pred_logits = model(imgs, pt)
+            # flatten video dim before model forward
+            b, t, c, h, w = imgs.shape
+            imgs_flat = imgs.view(b * t, c, h, w)
+            if pt is not None:
+                coords, labels = pt
+                n_points = coords.shape[-2]
+                coords_flat = coords.view(b * t, n_points, 2)
+                labels_flat = labels.view(b * t, n_points)
+                pt_flat = (coords_flat, labels_flat)
+            else:
+                pt_flat = None
+
+            pred_logits = model(imgs_flat, pt_flat)  # (B*T, C, H, W)
+
+            # reshape back to (B, T, C, H, W)
+            if isinstance(pred_logits, dict):
+                pred_logits = pred_logits["masks"]
+            c_out = pred_logits.shape[1]
+            pred_logits = pred_logits.view(b, t, c_out, h, w)
+            
             sum_time += (time.time() - start_time)
 
         val_loss = criterion(pred_logits, gt_masks)
@@ -248,7 +267,7 @@ def eval_mask_slice2_multi_class(valloader, model, criterion, opt, args):
             ses[eval_number, i] = se
             sps[eval_number, i] = sp
             # Hausdorff
-            hds[eval_number, i] = hausdorff_distance(pred_i[0, :, :], gt_i[0, :, :], distance="manhattan")
+            hds[eval_number, i] = hausdorff_distance(pred_i[0, :, :].astype(np.float32), gt_i[0, :, :].astype(np.float32), distance="manhattan")
             # 可视化（可选）
             if opt.visual and image_filename is not None:
                 visual_segmentation_sets_with_pt(pred_i, image_filename[0], opt, pt[0][0, :, :])
@@ -277,9 +296,10 @@ def eval_mask_slice2_multi_class(valloader, model, criterion, opt, args):
 
     mean_dice = np.mean(dice_mean[1:])
     mean_hdis = np.mean(hd_mean[1:])
+    mean_iou = np.mean(iou_mean[1:])
     print("test speed", eval_number/sum_time)
     if opt.mode == "train":
-        return dices, mean_dice, mean_hdis, val_losses
+        return dices, mean_dice, mean_hdis, mean_iou, val_losses
     else:
         return dice_mean, hd_mean, iou_mean, acc_mean, se_mean, sp_mean, dices_std, hd_std, iou_std, acc_std, se_std, sp_std
 
