@@ -64,7 +64,7 @@ python /home/lq/Projects_qin/surgical_semantic_seg/benmarking_algorithms/MemSAM/
 """
 
 """
-2026年04月17日debug记录
+2026年04月17/18日debug记录
 
 因为换用逻辑：就是把30类问题变成30个二值问题 每次训练输出一个图像+某个类别的bbox 输出一个binary mask然后重复30次
 
